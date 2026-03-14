@@ -6,6 +6,9 @@ import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 import { refreshCopilotToken } from "~/lib/token"
 
+/** Valid values for the Copilot API's output_config.effort field. */
+const COPILOT_EFFORT_VALUES = new Set(["low", "medium", "high", "max"])
+
 /**
  * Sanitize the payload to ensure compatibility with the Copilot API.
  *
@@ -15,6 +18,9 @@ import { refreshCopilotToken } from "~/lib/token"
  *   tool-call conversations) → replace with empty string
  * - Some versions reject an empty `tools` array → omit when empty
  * - Only accepts `response_format: { type: "json_object" }` → strip other types
+ * - Uses `output_config.effort` (not OpenAI's `reasoning_effort`); accepts only
+ *   `"low"`, `"medium"`, `"high"`, `"max"` → map from `reasoning_effort` and strip
+ *   unsupported values like `"auto"`
  */
 export function sanitizePayload(
   payload: ChatCompletionsPayload,
@@ -50,6 +56,30 @@ export function sanitizePayload(
     && sanitized.response_format.type !== "json_object"
   ) {
     delete sanitized.response_format
+  }
+
+  // Map OpenAI's reasoning_effort to Copilot's output_config.effort.
+  // reasoning_effort is always removed from the outgoing payload; Copilot only
+  // understands output_config.effort. Values "low"/"medium"/"high" are valid for
+  // both OpenAI and Copilot. "auto" and other OpenAI-only values are dropped.
+  if (sanitized.reasoning_effort !== null && sanitized.reasoning_effort !== undefined) {
+    const effort = sanitized.reasoning_effort
+    delete sanitized.reasoning_effort
+    if (COPILOT_EFFORT_VALUES.has(effort)) {
+      sanitized.output_config = { ...sanitized.output_config, effort }
+    }
+  }
+
+  // Sanitize output_config.effort if already present (e.g. sent directly by client).
+  // Strip the field if the value is not in the Copilot-accepted set.
+  if (
+    sanitized.output_config !== null
+    && sanitized.output_config !== undefined
+    && sanitized.output_config.effort !== undefined
+    && !COPILOT_EFFORT_VALUES.has(sanitized.output_config.effort)
+  ) {
+    const { effort: _effort, ...rest } = sanitized.output_config
+    sanitized.output_config = Object.keys(rest).length > 0 ? rest : undefined
   }
 
   return sanitized
@@ -269,6 +299,11 @@ export interface ChatCompletionsPayload {
     | { type: "function"; function: { name: string } }
     | null
   user?: string | null
+
+  /** OpenAI reasoning effort (o1/o3 models). Mapped to output_config.effort for Copilot. */
+  reasoning_effort?: string | null
+  /** Copilot-native output configuration. */
+  output_config?: { effort?: string; [key: string]: unknown } | null
 }
 
 export interface Tool {
