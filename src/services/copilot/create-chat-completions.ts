@@ -6,12 +6,63 @@ import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 import { refreshCopilotToken } from "~/lib/token"
 
+/**
+ * Sanitize the payload to ensure compatibility with the Copilot API.
+ *
+ * The Copilot API is stricter than the OpenAI spec in several ways:
+ * - Does not support the `developer` role (OpenAI alias for `system`) → map to `system`
+ * - Returns 500 when an assistant message has `content: null` (common in multi-turn
+ *   tool-call conversations) → replace with empty string
+ * - Some versions reject an empty `tools` array → omit when empty
+ * - Only accepts `response_format: { type: "json_object" }` → strip other types
+ */
+export function sanitizePayload(
+  payload: ChatCompletionsPayload,
+): ChatCompletionsPayload {
+  const messages: Array<Message> = payload.messages.map((msg) => {
+    const sanitized: Message = { ...msg }
+
+    // Map unsupported 'developer' role to 'system'
+    if (sanitized.role === "developer") {
+      sanitized.role = "system"
+    }
+
+    // Copilot API returns 500 on null content; use empty string instead
+    if (sanitized.content === null) {
+      sanitized.content = ""
+    }
+
+    return sanitized
+  })
+
+  const sanitized: ChatCompletionsPayload = { ...payload, messages }
+
+  // Remove empty tools array and tool_choice to avoid API errors
+  if (Array.isArray(sanitized.tools) && sanitized.tools.length === 0) {
+    delete sanitized.tools
+    delete sanitized.tool_choice
+  }
+
+  // Strip response_format types unsupported by the Copilot API
+  if (
+    sanitized.response_format !== null
+    && sanitized.response_format !== undefined
+    && sanitized.response_format.type !== "json_object"
+  ) {
+    delete sanitized.response_format
+  }
+
+  return sanitized
+}
+
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
-  const enableVision = payload.messages.some(
+  const sanitizedPayload = sanitizePayload(payload)
+
+  const enableVision = sanitizedPayload.messages.some(
     (x) =>
       typeof x.content !== "string"
       && x.content?.some((x) => x.type === "image_url"),
@@ -19,7 +70,7 @@ export const createChatCompletions = async (
 
   // Agent/user check for X-Initiator header
   // Determine if any message is from an agent ("assistant" or "tool")
-  const isAgentCall = payload.messages.some((msg) =>
+  const isAgentCall = sanitizedPayload.messages.some((msg) =>
     ["assistant", "tool"].includes(msg.role),
   )
 
@@ -30,7 +81,7 @@ export const createChatCompletions = async (
   })
 
   consola.debug("Sending request to Copilot:", {
-    model: payload.model,
+    model: sanitizedPayload.model,
     endpoint: `${copilotBaseUrl(state)}/chat/completions`,
   })
 
@@ -38,9 +89,9 @@ export const createChatCompletions = async (
 
   // Request usage stats in the final stream chunk
   const body =
-    payload.stream ?
-      { ...payload, stream_options: { include_usage: true } }
-    : payload
+    sanitizedPayload.stream ?
+      { ...sanitizedPayload, stream_options: { include_usage: true } }
+    : sanitizedPayload
 
   const bodyString = JSON.stringify(body)
 
@@ -109,7 +160,7 @@ export const createChatCompletions = async (
     )
   }
 
-  if (payload.stream) {
+  if (sanitizedPayload.stream) {
     return events(response)
   }
 
@@ -208,7 +259,7 @@ export interface ChatCompletionsPayload {
   presence_penalty?: number | null
   logit_bias?: Record<string, number> | null
   logprobs?: boolean | null
-  response_format?: { type: "json_object" } | null
+  response_format?: { type: string } | null
   seed?: number | null
   tools?: Array<Tool> | null
   tool_choice?:
