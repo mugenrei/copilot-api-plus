@@ -6,8 +6,37 @@ import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 import { refreshCopilotToken } from "~/lib/token"
 
-/** Valid values for the Copilot API's output_config.effort field. */
+/** Valid string values for the Copilot API's output_config.effort field. */
 const COPILOT_EFFORT_VALUES = new Set(["low", "medium", "high", "max"])
+
+/**
+ * Normalize an effort value (string or number) to a Copilot-accepted string.
+ *
+ * VS Code and other clients may send effort as:
+ *   - A named string: "low", "medium", "high", "max"  → kept as-is
+ *   - An OpenAI string: "auto" or anything else        → dropped (returns undefined)
+ *   - A float in [0, 1]: continuous scale mapped to tiers
+ *       ≤0.33 → "low", ≤0.67 → "medium", ≤1.0 → "high"
+ *   - A value in (1, 2]:  "high" (covers float 1.5 and integer 2)
+ *   - A value in (2, 3]:  "max"  (covers float 2.5 and integer 3)
+ *   - Values > 3:         "max"
+ *   - Non-finite (NaN, ±Infinity) or negative → dropped (returns undefined)
+ */
+export function normalizeEffort(effort: string | number): string | undefined {
+  if (typeof effort === "string") {
+    return COPILOT_EFFORT_VALUES.has(effort) ? effort : undefined
+  }
+
+  // Reject non-finite values (NaN, Infinity, -Infinity) and negatives
+  if (!Number.isFinite(effort) || effort < 0) return undefined
+
+  // Continuous scale mapped to the four Copilot tiers
+  if (effort <= 0.33) return "low"
+  if (effort <= 0.67) return "medium"
+  if (effort <= 2) return "high" // covers floats (0.67, 2] including 1.0, 1.5, 2
+  if (effort <= 3) return "max" // covers floats (2, 3] and integer 3
+  return "max"
+}
 
 /**
  * Sanitize the payload to ensure compatibility with the Copilot API.
@@ -19,8 +48,8 @@ const COPILOT_EFFORT_VALUES = new Set(["low", "medium", "high", "max"])
  * - Some versions reject an empty `tools` array → omit when empty
  * - Only accepts `response_format: { type: "json_object" }` → strip other types
  * - Uses `output_config.effort` (not OpenAI's `reasoning_effort`); accepts only
- *   `"low"`, `"medium"`, `"high"`, `"max"` → map from `reasoning_effort` and strip
- *   unsupported values like `"auto"`
+ *   `"low"`, `"medium"`, `"high"`, `"max"` → map from `reasoning_effort`, normalize
+ *   numeric values, and drop unsupported strings like `"auto"`
  */
 export function sanitizePayload(
   payload: ChatCompletionsPayload,
@@ -60,26 +89,36 @@ export function sanitizePayload(
 
   // Map OpenAI's reasoning_effort to Copilot's output_config.effort.
   // reasoning_effort is always removed from the outgoing payload; Copilot only
-  // understands output_config.effort. Values "low"/"medium"/"high" are valid for
-  // both OpenAI and Copilot. "auto" and other OpenAI-only values are dropped.
-  if (sanitized.reasoning_effort !== null && sanitized.reasoning_effort !== undefined) {
-    const effort = sanitized.reasoning_effort
+  // understands output_config.effort. Numeric values and named string tiers are
+  // normalized; "auto" and other unsupported strings are dropped.
+  if (
+    sanitized.reasoning_effort !== null
+    && sanitized.reasoning_effort !== undefined
+  ) {
+    const effort = normalizeEffort(sanitized.reasoning_effort)
     delete sanitized.reasoning_effort
-    if (COPILOT_EFFORT_VALUES.has(effort)) {
+    if (effort !== undefined) {
       sanitized.output_config = { ...sanitized.output_config, effort }
     }
   }
 
   // Sanitize output_config.effort if already present (e.g. sent directly by client).
-  // Strip the field if the value is not in the Copilot-accepted set.
+  // Normalize numeric values; strip the field if still invalid after normalization.
   if (
     sanitized.output_config !== null
     && sanitized.output_config !== undefined
     && sanitized.output_config.effort !== undefined
-    && !COPILOT_EFFORT_VALUES.has(sanitized.output_config.effort)
   ) {
-    const { effort: _effort, ...rest } = sanitized.output_config
-    sanitized.output_config = Object.keys(rest).length > 0 ? rest : undefined
+    const normalized = normalizeEffort(sanitized.output_config.effort)
+    if (normalized === undefined) {
+      const { effort: _effort, ...rest } = sanitized.output_config
+      sanitized.output_config = Object.keys(rest).length > 0 ? rest : undefined
+    } else {
+      sanitized.output_config = {
+        ...sanitized.output_config,
+        effort: normalized,
+      }
+    }
   }
 
   return sanitized
@@ -301,9 +340,9 @@ export interface ChatCompletionsPayload {
   user?: string | null
 
   /** OpenAI reasoning effort (o1/o3 models). Mapped to output_config.effort for Copilot. */
-  reasoning_effort?: string | null
+  reasoning_effort?: string | number | null
   /** Copilot-native output configuration. */
-  output_config?: { effort?: string; [key: string]: unknown } | null
+  output_config?: { effort?: string | number; [key: string]: unknown } | null
 }
 
 export interface Tool {

@@ -5,6 +5,7 @@ import type { ChatCompletionsPayload } from "../src/services/copilot/create-chat
 import { state } from "../src/lib/state"
 import {
   createChatCompletions,
+  normalizeEffort,
   sanitizePayload,
 } from "../src/services/copilot/create-chat-completions"
 
@@ -162,5 +163,124 @@ describe("sanitizePayload", () => {
     expect(payload.tools).toEqual([])
     expect(payload.tool_choice).toBe("none")
     expect(payload.response_format).toEqual({ type: "text" })
+  })
+
+  test("maps reasoning_effort string 'medium' to output_config.effort", () => {
+    const payload: ChatCompletionsPayload = {
+      messages: [{ role: "user", content: "hi" }],
+      model: "gpt-test",
+      reasoning_effort: "medium",
+    }
+    const result = sanitizePayload(payload)
+    expect(result.reasoning_effort).toBeUndefined()
+    expect(result.output_config?.effort).toBe("medium")
+  })
+
+  test("drops reasoning_effort 'auto' and does not set output_config.effort", () => {
+    const payload: ChatCompletionsPayload = {
+      messages: [{ role: "user", content: "hi" }],
+      model: "gpt-test",
+      reasoning_effort: "auto",
+    }
+    const result = sanitizePayload(payload)
+    expect(result.reasoning_effort).toBeUndefined()
+    expect(result.output_config?.effort).toBeUndefined()
+  })
+
+  test("maps numeric reasoning_effort 0.5 (float) to 'medium'", () => {
+    const payload: ChatCompletionsPayload = {
+      messages: [{ role: "user", content: "hi" }],
+      model: "gpt-test",
+      reasoning_effort: 0.5,
+    }
+    const result = sanitizePayload(payload)
+    expect(result.reasoning_effort).toBeUndefined()
+    expect(result.output_config?.effort).toBe("medium")
+  })
+
+  test("maps numeric reasoning_effort 0.8 (float) to 'high'", () => {
+    const payload: ChatCompletionsPayload = {
+      messages: [{ role: "user", content: "hi" }],
+      model: "gpt-test",
+      reasoning_effort: 0.8,
+    }
+    const result = sanitizePayload(payload)
+    expect(result.reasoning_effort).toBeUndefined()
+    expect(result.output_config?.effort).toBe("high")
+  })
+
+  test("maps numeric reasoning_effort 2 (integer) to 'high'", () => {
+    const payload: ChatCompletionsPayload = {
+      messages: [{ role: "user", content: "hi" }],
+      model: "gpt-test",
+      reasoning_effort: 2,
+    }
+    const result = sanitizePayload(payload)
+    expect(result.reasoning_effort).toBeUndefined()
+    expect(result.output_config?.effort).toBe("high")
+  })
+
+  test("normalizes numeric output_config.effort 2 to 'high'", () => {
+    const payload: ChatCompletionsPayload = {
+      messages: [{ role: "user", content: "hi" }],
+      model: "gpt-test",
+      output_config: { effort: 2 },
+    }
+    const result = sanitizePayload(payload)
+    expect(result.output_config?.effort).toBe("high")
+  })
+
+  test("strips invalid string output_config.effort", () => {
+    const payload: ChatCompletionsPayload = {
+      messages: [{ role: "user", content: "hi" }],
+      model: "gpt-test",
+      output_config: { effort: "auto" },
+    }
+    const result = sanitizePayload(payload)
+    expect(result.output_config).toBeUndefined()
+  })
+})
+
+describe("normalizeEffort", () => {
+  test("passes through valid string values unchanged", () => {
+    expect(normalizeEffort("low")).toBe("low")
+    expect(normalizeEffort("medium")).toBe("medium")
+    expect(normalizeEffort("high")).toBe("high")
+    expect(normalizeEffort("max")).toBe("max")
+  })
+
+  test("returns undefined for unsupported strings", () => {
+    expect(normalizeEffort("auto")).toBeUndefined()
+    expect(normalizeEffort("default")).toBeUndefined()
+    expect(normalizeEffort("")).toBeUndefined()
+  })
+
+  test("maps float 0-1 scale to string tiers", () => {
+    expect(normalizeEffort(0)).toBe("low")
+    expect(normalizeEffort(0.1)).toBe("low")
+    expect(normalizeEffort(0.33)).toBe("low")
+    expect(normalizeEffort(0.5)).toBe("medium")
+    expect(normalizeEffort(0.67)).toBe("medium")
+    expect(normalizeEffort(0.8)).toBe("high")
+    expect(normalizeEffort(1)).toBe("high")
+  })
+
+  test("maps integer tiers 2+ to string values", () => {
+    expect(normalizeEffort(2)).toBe("high")
+    expect(normalizeEffort(3)).toBe("max")
+    expect(normalizeEffort(4)).toBe("max")
+  })
+
+  test("maps float values between tiers correctly", () => {
+    expect(normalizeEffort(1.5)).toBe("high") // between integer 1 and 2
+    expect(normalizeEffort(2.5)).toBe("max") // between integer 2 and 3
+  })
+
+  test("returns undefined for invalid numeric inputs", () => {
+    expect(normalizeEffort(Number.NaN)).toBeUndefined()
+    expect(normalizeEffort(Number.POSITIVE_INFINITY)).toBeUndefined()
+    expect(normalizeEffort(Number.NEGATIVE_INFINITY)).toBeUndefined()
+    expect(normalizeEffort(-1)).toBeUndefined()
+    expect(normalizeEffort(-0.5)).toBeUndefined()
   })
 })
