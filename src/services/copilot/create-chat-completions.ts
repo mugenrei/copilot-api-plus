@@ -6,12 +6,132 @@ import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 import { refreshCopilotToken } from "~/lib/token"
 
+/** Valid string values for the Copilot API's output_config.effort field. */
+const COPILOT_EFFORT_VALUES = new Set(["low", "medium", "high", "max"])
+
+/**
+ * Normalize an effort value (string or number) to a Copilot-accepted string.
+ *
+ * VS Code and other clients may send effort as:
+ *   - A named string: "low", "medium", "high", "max"  → kept as-is
+ *   - An OpenAI string: "auto" or anything else        → dropped (returns undefined)
+ *   - A float in [0, 1]: continuous scale mapped to tiers
+ *       ≤0.33 → "low", ≤0.67 → "medium", ≤1.0 → "high"
+ *   - A value in (1, 2]:  "high" (covers float 1.5 and integer 2)
+ *   - A value in (2, 3]:  "max"  (covers float 2.5 and integer 3)
+ *   - Values > 3:         "max"
+ *   - Non-finite (NaN, ±Infinity) or negative → dropped (returns undefined)
+ */
+export function normalizeEffort(effort: string | number): string | undefined {
+  if (typeof effort === "string") {
+    return COPILOT_EFFORT_VALUES.has(effort) ? effort : undefined
+  }
+
+  // Reject non-finite values (NaN, Infinity, -Infinity) and negatives
+  if (!Number.isFinite(effort) || effort < 0) return undefined
+
+  // Continuous scale mapped to the four Copilot tiers
+  if (effort <= 0.33) return "low"
+  if (effort <= 0.67) return "medium"
+  if (effort <= 2) return "high" // covers floats (0.67, 2] including 1.0, 1.5, 2
+  if (effort <= 3) return "max" // covers floats (2, 3] and integer 3
+  return "max"
+}
+
+/**
+ * Sanitize the payload to ensure compatibility with the Copilot API.
+ *
+ * The Copilot API is stricter than the OpenAI spec in several ways:
+ * - Does not support the `developer` role (OpenAI alias for `system`) → map to `system`
+ * - Returns 500 when an assistant message has `content: null` (common in multi-turn
+ *   tool-call conversations) → replace with empty string
+ * - Some versions reject an empty `tools` array → omit when empty
+ * - Only accepts `response_format: { type: "json_object" }` → strip other types
+ * - Uses `output_config.effort` (not OpenAI's `reasoning_effort`); accepts only
+ *   `"low"`, `"medium"`, `"high"`, `"max"` → map from `reasoning_effort`, normalize
+ *   numeric values, and drop unsupported strings like `"auto"`
+ */
+export function sanitizePayload(
+  payload: ChatCompletionsPayload,
+): ChatCompletionsPayload {
+  const messages: Array<Message> = payload.messages.map((msg) => {
+    const sanitized: Message = { ...msg }
+
+    // Map unsupported 'developer' role to 'system'
+    if (sanitized.role === "developer") {
+      sanitized.role = "system"
+    }
+
+    // Copilot API returns 500 on null content; use empty string instead
+    if (sanitized.content === null) {
+      sanitized.content = ""
+    }
+
+    return sanitized
+  })
+
+  const sanitized: ChatCompletionsPayload = { ...payload, messages }
+
+  // Remove empty tools array and tool_choice to avoid API errors
+  if (Array.isArray(sanitized.tools) && sanitized.tools.length === 0) {
+    delete sanitized.tools
+    delete sanitized.tool_choice
+  }
+
+  // Strip response_format types unsupported by the Copilot API
+  if (
+    sanitized.response_format !== null
+    && sanitized.response_format !== undefined
+    && sanitized.response_format.type !== "json_object"
+  ) {
+    delete sanitized.response_format
+  }
+
+  // Map OpenAI's reasoning_effort to Copilot's output_config.effort.
+  // reasoning_effort is always removed from the outgoing payload; Copilot only
+  // understands output_config.effort. Numeric values and named string tiers are
+  // normalized; "auto" and other unsupported strings are dropped.
+  if (
+    sanitized.reasoning_effort !== null
+    && sanitized.reasoning_effort !== undefined
+  ) {
+    const effort = normalizeEffort(sanitized.reasoning_effort)
+    delete sanitized.reasoning_effort
+    if (effort !== undefined) {
+      sanitized.output_config = { ...sanitized.output_config, effort }
+    }
+  }
+
+  // Sanitize output_config.effort if already present (e.g. sent directly by client).
+  // Normalize numeric values; strip the field if still invalid after normalization.
+  if (
+    sanitized.output_config !== null
+    && sanitized.output_config !== undefined
+    && sanitized.output_config.effort !== undefined
+  ) {
+    const normalized = normalizeEffort(sanitized.output_config.effort)
+    if (normalized === undefined) {
+      const { effort: _effort, ...rest } = sanitized.output_config
+      sanitized.output_config = Object.keys(rest).length > 0 ? rest : undefined
+    } else {
+      sanitized.output_config = {
+        ...sanitized.output_config,
+        effort: normalized,
+      }
+    }
+  }
+
+  return sanitized
+}
+
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
-  const enableVision = payload.messages.some(
+  const sanitizedPayload = sanitizePayload(payload)
+
+  const enableVision = sanitizedPayload.messages.some(
     (x) =>
       typeof x.content !== "string"
       && x.content?.some((x) => x.type === "image_url"),
@@ -19,7 +139,7 @@ export const createChatCompletions = async (
 
   // Agent/user check for X-Initiator header
   // Determine if any message is from an agent ("assistant" or "tool")
-  const isAgentCall = payload.messages.some((msg) =>
+  const isAgentCall = sanitizedPayload.messages.some((msg) =>
     ["assistant", "tool"].includes(msg.role),
   )
 
@@ -30,7 +150,7 @@ export const createChatCompletions = async (
   })
 
   consola.debug("Sending request to Copilot:", {
-    model: payload.model,
+    model: sanitizedPayload.model,
     endpoint: `${copilotBaseUrl(state)}/chat/completions`,
   })
 
@@ -38,9 +158,9 @@ export const createChatCompletions = async (
 
   // Request usage stats in the final stream chunk
   const body =
-    payload.stream ?
-      { ...payload, stream_options: { include_usage: true } }
-    : payload
+    sanitizedPayload.stream ?
+      { ...sanitizedPayload, stream_options: { include_usage: true } }
+    : sanitizedPayload
 
   const bodyString = JSON.stringify(body)
 
@@ -109,7 +229,7 @@ export const createChatCompletions = async (
     )
   }
 
-  if (payload.stream) {
+  if (sanitizedPayload.stream) {
     return events(response)
   }
 
@@ -208,7 +328,7 @@ export interface ChatCompletionsPayload {
   presence_penalty?: number | null
   logit_bias?: Record<string, number> | null
   logprobs?: boolean | null
-  response_format?: { type: "json_object" } | null
+  response_format?: { type: string } | null
   seed?: number | null
   tools?: Array<Tool> | null
   tool_choice?:
@@ -218,6 +338,11 @@ export interface ChatCompletionsPayload {
     | { type: "function"; function: { name: string } }
     | null
   user?: string | null
+
+  /** OpenAI reasoning effort (o1/o3 models). Mapped to output_config.effort for Copilot. */
+  reasoning_effort?: string | number | null
+  /** Copilot-native output configuration. */
+  output_config?: { effort?: string | number; [key: string]: unknown } | null
 }
 
 export interface Tool {
